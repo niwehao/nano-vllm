@@ -28,8 +28,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        self.model = Qwen3ForCausalLM(hf_config)#权重是未初始化的空张量,但形状已是切分后的
+        load_model(self.model, config.model)## 从 safetensors 填入
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -38,13 +38,13 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
+        if self.world_size > 1:#给 TP 建立控制通道,并让 worker 进入待命状态。
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)#创建一块 1MB 的共享内存,取名 "nanovllm"。然后 barrier 等所有 rank 到齐。
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name="nanovllm")#按名字 attach 到同一块内存
                 self.loop()
 
     def exit(self):
@@ -60,8 +60,8 @@ class ModelRunner:
 
     def loop(self):
         while True:
-            method_name, args = self.read_shm()
-            self.call(method_name, *args)
+            method_name, args = self.read_shm()#阻塞等 rank 0 的指令,收到就执行,执行完继续等。
+            self.call(method_name, *args)#一次迭代 = 一次完整前向+生成 batch 个token
             if method_name == "exit":
                 break
 
@@ -82,11 +82,11 @@ class ModelRunner:
         for event in self.event:
             event.set()
 
-    def call(self, method_name, *args):
+    def call(self, method_name, *args):#效果是 8 张卡同时进入 run,各算各的那份权重分片,靠 NCCL all-reduce 汇总
         if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
+            self.write_shm(method_name, *args)#共享内存
         method = getattr(self, method_name, None)
-        return method(*args)
+        return method(*args)# model_runner.py:196
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -196,7 +196,7 @@ class ModelRunner:
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
+        else:# decode 要用 CUDA graph
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -213,6 +213,7 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        #这里context是真数据,之前只是一个烧录地址的动作
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
@@ -220,7 +221,7 @@ class ModelRunner:
         return token_ids
 
     @torch.inference_mode()
-    def capture_cudagraph(self):
+    def capture_cudagraph(self):#捕获计算图
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
@@ -231,21 +232,28 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        #上面这六个就是后来的 graph_vars —— replay 时往里写数据的固定地址
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
-        for bs in reversed(self.graph_bs):
+        for bs in reversed(self.graph_bs):#这个循环跑 36 次,每次为一个 batch size 造一张图。
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])#把静态张量的切片塞进全局 context。因为模型内部的 attention 层不是从参数拿这些,而是自己 get_context() 
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
+                self.graph_pool = graph.pool()#指定用哪个显存池
+            self.graphs[bs] = graph# 一张录好的图,里面烧死了
             torch.cuda.synchronize()
             reset_context()
+
+#             输入:  bs = 16
+# 产出:  self.graphs[16] = 一张录好的图,里面烧死了
+#          input_ids[:16] / positions[:16] / slot_mapping[:16] /
+#          context_lens[:16] / block_tables[:16] / outputs[:16]
+#          这六块的显存地址,以及 28 层全部 kernel 的调用序列
 
         self.graph_vars = dict(
             input_ids=input_ids,

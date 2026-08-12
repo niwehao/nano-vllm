@@ -39,7 +39,7 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = QKVParallelLinear(#定义类,传入完整尺寸
             hidden_size,
             self.head_dim,
             self.total_num_heads,

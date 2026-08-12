@@ -66,7 +66,7 @@ class ColumnParallelLinear(LinearBase):
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)# 切行
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -106,7 +106,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
-        self.num_heads = divide(total_num_heads, tp_size)
+        self.num_heads = divide(total_num_heads, tp_size)#自行计算每一个头多大
         self.num_kv_heads = divide(total_num_kv_heads, tp_size)
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
@@ -146,11 +146,11 @@ class RowParallelLinear(LinearBase):
             return
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)#切列
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            dist.all_reduce(y)#执行AR
         return y
