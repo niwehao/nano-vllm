@@ -55,7 +55,12 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
+        if context.logits_indices is not None:
+            # 统一路径:prepare_batch 已经算好该取哪些行(普通 seq 取各自 q 段的最后一个,
+            # 投机 seq 取全部 k+1 个)。为 None 时说明走的是纯 decode 的 graph 快路径,
+            # 每行本来就对应一条 seq,不用挑。
+            x = x[context.logits_indices].contiguous()
+        elif context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)

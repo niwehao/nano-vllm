@@ -121,6 +121,36 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
+    def ensure_capacity(self, seq: Sequence, num_extra: int) -> bool:
+        """保证 block_table 覆盖到位置 len(seq)+num_extra-1,不够就分配,空闲不足返回 False。
+
+        投机解码一步要写 k+1 个位置的 KV(last_token 加 k 个草稿),may_append 一次
+        只加一块不够用。num_extra=0 时与 may_append 完全等价:block_table 恒有
+        ceil(len/block_size) 块,而 decode 要写的位置 len-1 正好落在最后一块里。
+        先判断再分配,保证要么全成功要么不动,避免抢占逻辑看到半分配状态。
+        """
+        need = (len(seq) + num_extra + self.block_size - 1) // self.block_size - len(seq.block_table)
+        if need <= 0:
+            return True
+        if len(self.free_block_ids) < need:
+            return False
+        for _ in range(need):
+            seq.block_table.append(self._allocate_block())
+        return True
+
+    def truncate(self, seq: Sequence):
+        """投机验证后把多预留的尾部 block 还回去。
+
+        必须做:slot 计算和 last_block_num_tokens 都依赖 block_table[-1],
+        留着多余的块会让下一轮把 KV 写到错误的槽位。
+        """
+        while len(seq.block_table) > seq.num_blocks:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
     def hash_blocks(self, seq: Sequence):#把本轮新填满的 block 登记进 hash_to_block_id
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size

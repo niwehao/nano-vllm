@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.sampler import Sampler, compute_probs, sample_from_probs
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -97,7 +97,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run(seqs)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -110,8 +110,14 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        max_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        assert max_blocks > 0
+        if config.num_kvcache_blocks < 0:
+            config.num_kvcache_blocks = max_blocks
+        else:
+            # 显式指定 block 数(测试里用来稳定复现抢占路径),但不能超过显存放得下的上限
+            assert config.num_kvcache_blocks <= max_blocks, \
+                f"num_kvcache_blocks={config.num_kvcache_blocks} 超过显存上限 {max_blocks}"
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -126,7 +132,12 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_batch(self, seqs: list[Sequence]):
+        # 统一路径:prefill chunk 和 decode 用同一套变长表示。
+        # decode 只是 start = len-1、seqlen_q = 1 的退化情形 —— postprocess 之后恒有
+        # num_cached_tokens == len(seq) - 1,代入下面的循环就自动得到
+        # input = 最后一个 token、position = len-1、seqlen_k = len,和原来的
+        # prepare_decode 完全一致,所以不需要为 decode 单独写一份。
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -140,7 +151,7 @@ class ModelRunner:
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
+            input_ids.extend(seq.scheduled_token_ids)
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -159,17 +170,40 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        # [OLD ↓ 下面 1 行] 原来的判断条件是 `if cu_seqlens_k[-1] > cu_seqlens_q[-1]:`,
+        #                   行尾带这条注释,条件已重写,注释原文保留在此
+        # prefix cache
+        # [NEW] 统一路径下一律走 paged 读取:只要 KV cache 已分配就必须给 block_table,
+        # 否则 decode 行(seqlen_k >> seqlen_q)根本没法从本轮的 k/v 里取到历史。
+        # 只有 warmup(cache 还没分配、block_table 为空)才保持 None。
+        if any(seq.block_table for seq in seqs):
             block_tables = self.prepare_block_tables(seqs)
+        # lm_head 只对需要的行算 logits:普通 seq 取它那段 q 的最后一个位置,
+        # 投机 seq 的验证前向要全部 k+1 个位置(每个位置都要判断草稿接受与否)。
+        # 顺带把 chunked prefill 中间块的无用行也剔掉了 —— 那些行原来算完就丢。
+        logits_indices = []
+        offset = 0
+        for seq in seqs:
+            q = seq.num_scheduled_tokens
+            if seq.draft_tokens:
+                logits_indices.extend(range(offset, offset + q))
+            else:
+                logits_indices.append(offset + q - 1)
+            offset += q
+        logits_indices = torch.tensor(logits_indices, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None,
+                    block_tables, logits_indices)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        # 只剩"纯 decode 批走 CUDA graph 快路径"这一个用途(Phase 2.5 Step A)。
+        # 混批和 prefill 一律走 prepare_batch。图里烧死的是 flash_attn_with_kvcache 的
+        # decode 形态,所以喂给它的 context 必须还是老样子(context_lens + is_prefill=False)。
         input_ids = []
         positions = []
         slot_mapping = []
@@ -188,13 +222,143 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = [seq.temperature for seq in seqs]
+        vocab_size = self.config.hf_config.vocab_size
+        # 投机 seq 在 logits 里占 1+k 行,其余占 1 行 —— 采样参数要按行展开
+        rows = [1 + len(seq.draft_tokens) for seq in seqs]
+        def expand(vals):
+            out = []
+            for v, n in zip(vals, rows):
+                out.extend([v] * n)
+            return out
+
+        temperatures = expand([seq.temperature for seq in seqs])
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+        # 全 batch 都没开 top_k / top_p 时传 None,apply_top_k_top_p 整段跳过那次 [B, V] 的 sort。
+        # 判断在 CPU 上做(这些值本来就在 CPU),不引入 GPU 同步。
+        raw_ks = [seq.top_k if seq.top_k != -1 else vocab_size for seq in seqs]
+        if any(k < vocab_size for k in raw_ks):
+            top_ks = torch.tensor(expand(raw_ks), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        else:
+            top_ks = None
+        raw_ps = [seq.top_p for seq in seqs]
+        if any(p < 1.0 for p in raw_ps):
+            top_ps = torch.tensor(expand(raw_ps), dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        else:
+            top_ps = None
+        max_logprobs = max((seq.num_logprobs if seq.num_logprobs is not None else -1) for seq in seqs)
+        return temperatures, top_ks, top_ps, max_logprobs
+
+    def unpack_logprobs(self, seqs: list[Sequence], token_ids: list[int], payload):
+        # payload 里的张量一次性 .tolist(),避免逐 seq 触发 GPU 同步
+        if payload is None:
+            return None
+        token_logprobs, top_ids, top_logprobs = payload
+        token_logprobs = token_logprobs.tolist()
+        top_ids = top_ids.tolist() if top_ids is not None else None
+        top_logprobs = top_logprobs.tolist() if top_logprobs is not None else None
+        result = []
+        for i, seq in enumerate(seqs):
+            n = seq.num_logprobs
+            if n is None:
+                result.append(None)
+                continue
+            item = {"token_id": token_ids[i], "logprob": token_logprobs[i]}
+            if n > 0:
+                # batch 里传的是全批最大的 N,这里按每条 seq 自己的 N 截取
+                item["top_logprobs"] = list(zip(top_ids[i][:n], top_logprobs[i][:n]))
+            result.append(item)
+        return result
+
+    def sample_speculative(self, seqs: list[Sequence], logits: torch.Tensor, sample_args):
+        """投机解码的验证 + 接受判定。
+
+        n-gram 草稿是确定性提议,等价于草稿分布 q = δ_d(在 d 上是 1 的 one-hot)。
+        代入 Leviathan 的接受规则:
+            以概率 min(1, p(d)/q(d)) = p(d) 接受 d;
+            拒绝时从 norm(max(p - q, 0)) = "把 d 挖掉再归一化的 p" 采样。
+        这样产出的 token 分布与不投机时逐分布相同。
+
+        temperature=0(greedy)单独走一条路:直接比 token 而不是比概率,
+        避免浮点边界问题,也让"开关投机输出必须逐 token 一致"成为严格恒等。
+        """
+        temperatures, top_ks, top_ps, _ = sample_args
+        probs = compute_probs(logits, temperatures, top_ks, top_ps)
+        greedy_tok = logits.float().argmax(dim=-1)
+        sampled = sample_from_probs(probs)
+        tokens = torch.where(temperatures == 0, greedy_tok, sampled)
+
+        # 每一行对应的草稿 token(非草稿行填 0,后面不会用到)
+        flat_draft = []
+        for seq in seqs:
+            flat_draft.extend(seq.draft_tokens)
+            flat_draft.append(0)          # 每条 seq 的最后一行是"奖励 token"行,没有草稿
+        draft_ids = torch.tensor(flat_draft, dtype=torch.int64, device=logits.device)
+
+        any_sampling = bool((temperatures != 0).any().item())
+        if any_sampling:
+            p_d = probs.gather(dim=-1, index=draft_ids.unsqueeze(dim=1)).squeeze(dim=1)
+            resid = probs.scatter(dim=-1, index=draft_ids.unsqueeze(dim=1),
+                                  src=torch.zeros_like(p_d).unsqueeze(dim=1))
+            resid = resid / resid.sum(dim=-1, keepdim=True).clamp_min(1e-10)
+            resid_tok = sample_from_probs(resid)
+            rand = torch.rand(logits.size(0), device=logits.device)
+            p_d_l, resid_tok_l, rand_l = p_d.tolist(), resid_tok.tolist(), rand.tolist()
+        else:
+            p_d_l = resid_tok_l = rand_l = None
+
+        greedy_l = greedy_tok.tolist()
+        tokens_l = tokens.tolist()
+
+        out_tokens, accepted = [], []
+        r = 0
+        for seq in seqs:
+            k = len(seq.draft_tokens)
+            if k == 0:
+                out_tokens.append([tokens_l[r]])
+                accepted.append(0)
+                r += 1
+                continue
+            is_greedy = seq.temperature == 0
+            emitted, a = [], 0
+            for i, d in enumerate(seq.draft_tokens):
+                row = r + i
+                if is_greedy:
+                    ok = greedy_l[row] == d
+                else:
+                    ok = rand_l[row] < p_d_l[row]
+                if ok:
+                    emitted.append(d)
+                    a += 1
+                else:
+                    emitted.append(greedy_l[row] if is_greedy else resid_tok_l[row])
+                    break
+            else:
+                # 全部接受,再白赚一个"奖励 token"(第 k+1 行本来就是免费算出来的)
+                emitted.append(tokens_l[r + k])
+            out_tokens.append(emitted)
+            accepted.append(a)
+            r += k + 1
+        return out_tokens, accepted
+
+    def is_pure_decode(self, seqs: list[Sequence]) -> bool:
+        # 纯 decode 批(每条 q 长度都是 1)可以走 flash_attn_with_kvcache —— 那个 kernel
+        # 是专为 q=1 做 split-K 优化的,比通用变长 kernel 快一截(实测 decode step
+        # 16.2ms vs 19.4ms)。所以"用哪个 kernel"和"要不要 replay CUDA graph"必须分开判断:
+        # 早先把两者合成一个条件,导致 eager 模式下的纯 decode 也被赶去走变长路径,
+        # decode 吞吐白掉了 18%。
+        # 投机 seq 的 q 长度是 k+1,同样不能走 q=1 的快路径
+        return not any(seq.is_prefill or seq.num_scheduled_tokens != 1 for seq in seqs)
+
+    def use_cudagraph(self, seqs: list[Sequence]) -> bool:
+        # 图里烧死的是 q 长度恒为 1 的 decode 形态,所以只有纯 decode 批能 replay。
+        # 混批里 prefill chunk 的 q 长度是变的,图化不了,只能走 eager 变长路径。
+        if self.enforce_eager or not self.is_pure_decode(seqs):
+            return False
+        return len(seqs) <= self.graph_bs[-1]
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, use_graph: bool):
+        if not use_graph:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:# decode 要用 CUDA graph
             bs = input_ids.size(0)
@@ -211,14 +375,26 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Sequence]):
+        pure_decode = self.is_pure_decode(seqs)
+        use_graph = pure_decode and self.use_cudagraph(seqs)
+        input_ids, positions = self.prepare_decode(seqs) if pure_decode else self.prepare_batch(seqs)
         #这里context是真数据,之前只是一个烧录地址的动作
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        sample_args = self.prepare_sample(seqs) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, use_graph)
+        if self.rank != 0:
+            reset_context()
+            return None
+        if any(seq.draft_tokens for seq in seqs):
+            token_ids, accepted = self.sample_speculative(seqs, logits, sample_args)
+            reset_context()
+            return token_ids, None, accepted
+        tokens, payload = self.sampler(logits, *sample_args)
+        flat = tokens.tolist()
+        logprobs = self.unpack_logprobs(seqs, flat, payload)
         reset_context()
-        return token_ids
+        # 统一成"每条 seq 一个 token 列表",投机时这个列表会更长
+        return [[t] for t in flat], logprobs, [0] * len(seqs)
 
     @torch.inference_mode()
     def capture_cudagraph(self):#捕获计算图

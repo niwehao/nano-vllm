@@ -35,10 +35,20 @@ class Sequence:#引擎处理这条请求过程中需要记住的所有信息,都
         #chunked prefill 用的游标:已经算完 KV 的有多少、这一轮打算算多少
         self.num_scheduled_tokens = 0 #本轮安排给这条 seq 计算多少个 token,是个每轮重置的临时值
         self.is_prefill = True
+        # token_ids[i] 对应的绝对位置是 token_offset + i。
+        # driver 侧恒为 0(存着完整序列);TP worker 侧只收到本轮被调度的那一段切片,
+        # 于是 token_offset = num_cached_tokens。有了它,scheduled_token_ids 两侧写法一致。
+        self.token_offset = 0
+        # 投机解码:本轮提议的草稿 token(还没被目标模型验证,不算进 token_ids)
+        self.draft_tokens: list[int] = []
         self.block_table = []#这条 seq 占用的 KV cache block 编号,入队时是空的,等 scheduler 真正调度到它才分配
         self.temperature = sampling_params.temperature
+        self.top_p = sampling_params.top_p
+        self.top_k = sampling_params.top_k
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.num_logprobs = sampling_params.logprobs
+        self.completion_logprobs: list[dict] = []    # 只在 rank 0 的 driver 进程里累积,不进 __getstate__
 
     def __len__(self):
         return self.num_tokens
@@ -70,6 +80,16 @@ class Sequence:#引擎处理这条请求过程中需要记住的所有信息,都
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
+    @property
+    def scheduled_token_ids(self) -> list[int]:
+        # 本轮要送进模型的那一段 token。prefill 是一个 chunk,decode 就是最后那 1 个,
+        # 统一调度后 prepare_batch 对两者用同一个取法。
+        # 投机解码时后面再接上 k 个草稿 token —— 它们还没被验证,不在 token_ids 里,
+        # 但这一轮要和 last_token 一起送进目标模型做验证前向(q 长度 = k+1)。
+        start = self.num_cached_tokens - self.token_offset
+        n = self.num_scheduled_tokens - len(self.draft_tokens)
+        return self.token_ids[start: start + n] + self.draft_tokens
+
     def block(self, i):
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
@@ -79,15 +99,28 @@ class Sequence:#引擎处理这条请求过程中需要记住的所有信息,都
         self.last_token = token_id
         self.num_tokens += 1
 
+    def truncate_to(self, n: int):
+        # 投机一步可能吐出多个 token,如果其中某个撞上 eos / max_tokens,
+        # 后面的要丢掉。注意 KV 和 hash 登记按"实际算出来的"来做,这里只裁 token 序列;
+        # 这条 seq 紧接着就 FINISHED 并释放全部 block,不会有不一致残留。
+        del self.token_ids[n - self.token_offset:]
+        self.num_tokens = n
+        self.last_token = self.token_ids[-1]
+
     def __getstate__(self):
-        last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        # 统一调度后 worker 侧的 prepare_batch 对 prefill / decode 一视同仁,都要取
+        # scheduled_token_ids,所以不能再像以前那样 decode 只传一个 last_token
+        # (那样 worker 上取切片会越界)。改成一律只传本轮被调度的那一段,
+        # 通信量和以前的 decode 路径一样是 O(本轮 token 数),不传整条历史。
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+                self.num_scheduled_tokens, self.block_table, self.is_prefill,
+                self.draft_tokens, self.scheduled_token_ids)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
-        if isinstance(last_state, list):
-            self.token_ids = last_state
-            self.last_token = self.token_ids[-1]
-        else:
-            self.token_ids = []
-            self.last_token = last_state
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+         self.num_scheduled_tokens, self.block_table, self.is_prefill,
+         self.draft_tokens, scheduled) = state
+        # worker 侧 token_ids 只有本轮切片(含草稿),token_offset 记下它的起点
+        self.token_ids = scheduled[:len(scheduled) - len(self.draft_tokens)]
+        self.token_offset = self.num_cached_tokens
+        self.last_token = scheduled[-1] if scheduled else -1

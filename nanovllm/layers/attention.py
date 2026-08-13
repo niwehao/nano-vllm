@@ -62,6 +62,11 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
+            # [OLD ↓ 下一行行尾] 原注释 "# prefix cache" 保留原文不动,现已过时
+            # [NEW] 现状:这里是通用的 paged 读取路径,不再只服务 prefix cache 命中。
+            #       Phase 2 统一调度后,prefill chunk / decode / 混批 / 投机验证前向
+            #       都从这条路走,一律经 block_table 从 paged KV cache 读 K/V。
+            #       条件为假只剩 warmup 一种情况(cache 还没分配),那时才用本轮的 k/v。
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,

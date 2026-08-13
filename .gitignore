@@ -193,3 +193,5 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# nano-vllm 测试运行产物（每次运行重新生成，不入库）
+tests/out/
