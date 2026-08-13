@@ -18,6 +18,9 @@
 # --revert 删掉再重载即可完全还原。两台机器都要各跑一遍。
 
 set -uo pipefail
+# rmmod/modprobe/modinfo 只在 /sbin 和 /usr/sbin 里，/usr/bin 没有；
+# 不同 sudo 配置的 secure_path 不一定都带上，显式补进去。
+PATH=/usr/sbin:/sbin:$PATH
 CONF=/etc/modprobe.d/nvidia-ibgda.conf
 MODINFO=$(command -v modinfo || echo /sbin/modinfo)
 MODE=${1:-}
@@ -40,13 +43,25 @@ echo "  当前 RegistryDwords         : \"$(grep -oP 'RegistryDwords:\s*"\K[^"]*
 reload() {
   systemctl stop nvidia-persistenced 2>/dev/null
   sleep 1
-  # 顺序要紧：先卸依赖 nvidia 的，最后卸 nvidia 自己
+  # 顺序要紧：先卸依赖 nvidia 的，最后卸 nvidia 自己。
+  #
+  # 判断模块在不在**不要**写成 `lsmod | grep -q "^$m "`：grep -q 一匹配就退出并关掉
+  # 管道，lsmod 还在写就吃 SIGPIPE 退出 141，配上 `set -o pipefail` 整条管道判为失败，
+  # && 直接短路 —— rmmod 一次都没跑，而且一句提示都没有（第一版就栽在这里：配置写了、
+  # nvidia-smi 正常、参数却没生效，看不出任何异常）。直接看 /sys/module 没有这个问题。
   for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
-    lsmod | grep -q "^$m " && { rmmod $m || { echo "rmmod $m 失败，查占用：fuser -v /dev/nvidia*"; return 1; }; }
+    if [ -d "/sys/module/$m" ]; then
+      rmmod "$m" || { echo "  ✗ rmmod $m 失败。查占用：fuser -v /dev/nvidia* ；lsof /dev/nvidia*"; return 1; }
+      echo "  已卸载 $m"
+    fi
   done
-  modprobe nvidia && modprobe nvidia_uvm
+  # 硬断言：真的卸干净了才继续，否则后面 modprobe 是空操作，会静默"成功"
+  [ -d /sys/module/nvidia ] && { echo "  ✗ nvidia 模块仍在（refcnt=$(cat /sys/module/nvidia/refcnt 2>/dev/null)），中止"; return 1; }
+  modprobe nvidia   || { echo "  ✗ modprobe nvidia 失败，看 dmesg"; return 1; }
+  modprobe nvidia_uvm || { echo "  ✗ modprobe nvidia_uvm 失败"; return 1; }
   modprobe nvidia_drm 2>/dev/null       # headless 用不到，装回去只为还原原状态
   systemctl start nvidia-persistenced 2>/dev/null
+  echo "  已重新加载（模块时间戳 $(stat -c %y /sys/module/nvidia | cut -d. -f1)）"
   nvidia-smi -L
 }
 
