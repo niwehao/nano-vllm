@@ -24,6 +24,11 @@ export NCCL_IB_HCA=$HCA
 export NVSHMEM_HCA_LIST="${HCA}:1"
 export NVSHMEM_IB_GID_INDEX=$GID_INDEX
 export NVSHMEM_DISABLE_P2P=1          # 每机单卡，没有 NVLink peer
+# NVSHMEM 3.x 选通道用这个。只设 DeepEP 那个 NVSHMEM_IB_ENABLE_IBGDA=1（2.x 的开关）
+# 的话会默默退回 ibrc（CPU 代理），跑得通但根本不是 IBGDA。
+export NVSHMEM_REMOTE_TRANSPORT=ibgda
+export NVSHMEM_IB_ENABLE_IBGDA=1
+export NVSHMEM_QP_DEPTH=2048          # 断言是 >= (M+1)*2，M=512 时默认 1024 必炸
 
 # ---- 挂死变报错（跨机调试的必需品）----
 export TORCH_NCCL_BLOCKING_WAIT=1

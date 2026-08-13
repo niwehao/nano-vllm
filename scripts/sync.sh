@@ -34,6 +34,16 @@ if [ "${1:-}" = "--venv" ]; then
   R --delete "$VENV/" "$GPU01_SSH:$VENV/"
 fi
 
+# 防呆：默认模式不同步 .venv，装了新包却忘了 --venv 的话，远端 import 会以
+# "libxxx.so: cannot open shared object file" 这种离题的报错形式炸出来（M5 冒烟时
+# 就被 nvshmem 坑过一次）。这里比一下两边的包清单，不一致就提醒。
+LOCAL_PKGS=$(ls "$VENV/lib/python3.12/site-packages" | md5sum | cut -c1-8)
+REMOTE_PKGS=$(SSH $GPU01_SSH "ls $VENV/lib/python3.12/site-packages 2>/dev/null | md5sum | cut -c1-8")
+if [ "$LOCAL_PKGS" != "$REMOTE_PKGS" ]; then
+  echo "⚠ 两边 .venv 的包清单不一致（本机 $LOCAL_PKGS / 远端 $REMOTE_PKGS）"
+  echo "  跑 ./scripts/sync.sh --venv 同步环境"
+fi
+
 echo ">>> 冒烟"
 SSH $GPU01_SSH "$VENV/bin/python -c \"
 import torch, transformers
