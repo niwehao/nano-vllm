@@ -65,9 +65,16 @@ if __name__ == "__main__":
                   "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
                   "-U__CUDA_NO_HALF2_OPERATORS__", "-U__CUDA_NO_BFLOAT16_OPERATORS__",
                   "-U__CUDA_NO_BFLOAT16_CONVERSIONS__", "-U__CUDA_NO_BFLOAT162_OPERATORS__"]
-    sources = [str(HERE / "csrc" / "python_api.cpp"), str(HERE / "csrc" / "nvshmem_glue.cu")]
-    if os.getenv("NANOEP_WITH_LL", "1") == "1" and (HERE / "csrc" / "internode_ll.cu").exists():
-        sources.append(str(HERE / "csrc" / "internode_ll.cu"))
+    sources = [str(HERE / "csrc" / "python_api.cpp"), str(HERE / "csrc" / "nvshmem_glue.cu"),
+               str(HERE / "csrc" / "nano_buffer.cu")]
+    ll = HERE / "csrc" / "legacy" / "internode_ll.cu"
+    if os.getenv("NANOEP_WITH_LL", "1") == "1" and ll.exists():
+        sources.append(str(ll))
+        # DISABLE_SM90_FEATURES 是白拿的手术刀：utils.cuh 里 elect_one_sync 自动走 lane0
+        # 回退、整段 TMA 定义被条件编译掉。我们只需要额外覆盖 launch.cuh 的启动宏
+        # （要 cooperative、不要 cluster）与 compiled.cuh 的 FP8 分支（SM89 原生支持）。
+        nvcc_flags.append("-DDISABLE_SM90_FEATURES")
+        cxx_flags.append("-DDISABLE_SM90_FEATURES")
 
     host_lib = versioned_so(nvshmem / "lib", "libnvshmem_host")
     print(f" > NVSHMEM: {nvshmem}")
@@ -79,7 +86,8 @@ if __name__ == "__main__":
         ext_modules=[CUDAExtension(
             name="nanodeepep._C",
             sources=sources,
-            include_dirs=[str(HERE / "csrc"), str(nvshmem / "include")],
+            include_dirs=[str(HERE / "csrc"), str(HERE / "csrc" / "legacy"),
+                          str(nvshmem / "include")],
             library_dirs=[str(nvshmem / "lib")],
             extra_compile_args={
                 "cxx": cxx_flags,

@@ -38,4 +38,9 @@ int my_pe();
 int n_pes();
 bool put_test(int64_t nelem);
 
+// Buffer（nano_buffer.cu）
+void buffer_create(int rank, int num_ranks, int num_experts, int hidden, int m);
+void buffer_destroy();
+size_t buffer_bytes();
+
 }  // namespace nanoep

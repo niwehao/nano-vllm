@@ -20,7 +20,7 @@ cleanup; sleep 0.5
 $SSH "cd $REPO && source scripts/env.sh && \
   setsid nohup env RANK=1 WORLD_SIZE=2 \
     MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT PYTHONPATH=$REPO \
-    .venv/bin/python $* > /tmp/nano_rank1.log 2>&1 < /dev/null &" >/dev/null 2>&1 &
+    ${RUN2_LAUNCHER:-} .venv/bin/python $* > /tmp/nano_rank1.log 2>&1 < /dev/null &" >/dev/null 2>&1 &
 # 末尾这个 & 把**本地的 ssh 进程**也放后台，不能省：远端命令里的 & 只让远端
 # 那条 bash 立刻返回，ssh 自己还会一直等远端会话的 fd 全部关闭才退出，
 # 结果就是 driver 根本走不到下一行（排查过一轮：远端 worker 起来了、本机却卡住）。
@@ -28,7 +28,8 @@ sleep 3
 
 export RANK=0 WORLD_SIZE=2 PYTHONPATH=$REPO
 cd "$REPO"
-timeout "${RUN2_TIMEOUT:-900}" .venv/bin/python "$@"
+# RUN2_LAUNCHER 可以塞 compute-sanitizer 之类的包装器（两端都会用上）
+timeout "${RUN2_TIMEOUT:-900}" ${RUN2_LAUNCHER:-} .venv/bin/python "$@"
 rc=$?
 
 echo "----- rank1 (gpu-01) 日志尾部 -----"
