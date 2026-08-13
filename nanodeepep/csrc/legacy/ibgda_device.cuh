@@ -78,11 +78,23 @@ __device__ static __forceinline__ nvshmemi_ibgda_device_state_t* ibgda_get_state
     return &nvshmemi_ibgda_device_state_d;
 }
 
+// [nano-deepEP] 修改原因：**RC 队列数组的排布在 NVSHMEM 版本间变了**。
+//
+// 上游这里按 **PE-major** 索引：idx = pe * num_rc_per_pe * ndev + id % (...)
+// 而本机 NVSHMEM 3.7.2 的官方实现（include/non_abi/device/pt-to-pt/ibgda_device.cuh:1813）
+// 是 **QP-major**：idx = id * npes + pe
+//
+// 排布不一致的后果不是越界（两种算法在 npes=2、num_rc_per_pe=2 时都落在 0..3），
+// 而是**拿到连向错误对端的 QP**。更要命的是 NVSHMEM 只初始化 pe != mype 的槽位
+// （官方实现里有 assert(pe != mype)），self 槽全是 0 —— 于是 tx_wq.wqe 是空指针，
+// 后面 ibgda_get_wqe_ptr 算出来的地址就成了 0xffffffc28 这种小得离谱的值。
+//
+// 症状：R=2 时 dispatch 内核 illegal memory access，R=1 一切正常（R=1 不走远端路径）。
+// 定位过程见 Plan-4/08-implementation-report.md 坑 26。
 __device__ static __forceinline__ nvshmemi_ibgda_device_qp_t* ibgda_get_rc(int pe, int id) {
     auto state = ibgda_get_state();
-    const auto num_rc_per_pe = ibgda_get_state()->num_rc_per_pe;
-    return &state->globalmem
-                .rcs[pe * num_rc_per_pe * state->num_devices_initialized + id % (num_rc_per_pe * state->num_devices_initialized)];
+    const auto rc_modulo = state->num_rc_per_pe * state->num_devices_initialized;
+    return &state->globalmem.rcs[(id % rc_modulo) * nvshmemi_device_state_d.npes + pe];
 }
 
 __device__ static __forceinline__ void ibgda_lock_acquire(int* lock) {
@@ -229,6 +241,17 @@ ibgda_get_lkey_and_rkey(uint64_t laddr, __be32* lkey, uint64_t raddr, int dst_pe
 
     // Return the minimum of local and remote chunk sizes
     auto rchunk_size = device_key.next_addr - roffset;
+#ifdef NANOEP_IBGDA_DEBUG
+    // [nano-deepEP] 可开关的调试打点（默认不编译）。查 "raddr 落在堆外导致 idx 爆掉"
+    // 这类问题时，光看 sanitizer 的地址反推很慢，直接把中间量打出来最快。
+    printf("[lkey_rkey] pe=%d laddr=0x%llx raddr=0x%llx heap=0x%llx roff=0x%llx "
+           "lidx?=%llu ridx=%llu lchunk=0x%llx rchunk=0x%llx next_addr=0x%llx\n",
+           nvshmem_my_pe(), (unsigned long long)laddr, (unsigned long long)raddr,
+           (unsigned long long)heap_start, (unsigned long long)roffset,
+           (unsigned long long)(((laddr - heap_start) >> log2_cumem_granularity) * state->num_devices_initialized + dev_idx),
+           (unsigned long long)idx, (unsigned long long)lchunk_size,
+           (unsigned long long)rchunk_size, (unsigned long long)device_key.next_addr);
+#endif
     return min(lchunk_size, rchunk_size);
 }
 

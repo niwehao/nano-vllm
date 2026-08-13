@@ -16,6 +16,9 @@
 #include <nvshmemx.h>
 
 #include "nano_ep.cuh"
+// compiled.cuh 要排在前面：utils.cuh 用它定义的 LEGACY_* 宏
+#include "legacy/compiled.cuh"
+#include "legacy/ibgda_device.cuh"
 
 namespace nanoep {
 
@@ -104,6 +107,82 @@ bool put_test(int64_t nelem) {
     for (int64_t i = 0; i < nelem; ++i)
         if (got[i] != want) { ok = false; break; }
 
+    nvshmem_free(local);
+    nvshmem_free(sym);
+    return ok;
+}
+
+// ---------------------------------------------- IBGDA 手写 WQE 路径的探针
+//
+// 前面那个 put_test 用的是 NVSHMEM **官方 API**（nvshmemx_putmem_block），它验证的是
+// "IBGDA 传输层能不能用"。DeepEP 的内核走的是另一条路：自己往 mlx5 的发送队列写 WQE、
+// 自己按门铃（nvshmemi_ibgda_put_nbi_warp，ibgda_device.cuh:337）。两条路的前提不同，
+// 官方 API 通过**不代表**手写路径通过 —— M5 的 R=2 崩溃就卡在这个区别上。
+//
+// 这个探针做两件事：把设备侧看到的 IBGDA 状态打出来（状态没被填的话 rcs 会是空指针，
+// 那是最常见的"链接进来了但没初始化"故障），然后走一次手写 WQE 的 put。
+
+using deep_ep::legacy::get_lane_id;
+using deep_ep::legacy::ibgda_get_state;
+using deep_ep::legacy::nvshmemi_ibgda_put_nbi_warp;
+
+__global__ void ibgda_probe_kernel(uint64_t dst, uint64_t src, size_t nbytes, int dst_pe, int qp_id) {
+    const auto lane_id = get_lane_id();
+    if (threadIdx.x == 0 and blockIdx.x == 0) {
+        auto st = ibgda_get_state();
+        // 注意：CUDA 的设备侧 printf **不支持 %zu**，size_t 要显式转成 unsigned long long 用 %llu。
+        // （第一版写 %zu，输出里原样打了 "%zu" 三个字符，白跑一轮。）
+        const auto heap = reinterpret_cast<uint64_t>(nvshmemi_device_state_d.heap_base);
+        const auto g = st->log2_cumem_granularity;
+        const uint64_t lidx = ((src - heap) >> g) * st->num_devices_initialized;
+        const uint64_t roff = dst - heap;
+        const uint64_t ridx = ((roff >> g) * nvshmemi_device_state_d.npes) * st->num_devices_initialized
+                              + dst_pe * st->num_devices_initialized;
+        printf("[ibgda-probe] pe=%d num_rc_per_pe=%u ndev=%d rcs=%p nic_gpumem=%d batch=%u\n"
+               "              log2_cumem_granularity=%llu heap_base=0x%llx npes=%d\n"
+               "              src=0x%llx dst=0x%llx  lkey_idx=%llu rkey_idx=%llu (MAX_CONST_RKEYS=%d)\n"
+               "              peer_heap_base_remote[%d]=%p  lkeys[lidx].key=0x%x\n",
+               nvshmem_my_pe(), st->num_rc_per_pe, st->num_devices_initialized,
+               (void*)st->globalmem.rcs, (int)st->nic_buf_on_gpumem, st->num_requests_in_batch,
+               (unsigned long long)g, (unsigned long long)heap, nvshmemi_device_state_d.npes,
+               (unsigned long long)src, (unsigned long long)dst,
+               (unsigned long long)lidx, (unsigned long long)ridx, (int)NVSHMEMI_IBGDA_MAX_CONST_RKEYS,
+               dst_pe, (void*)nvshmemi_device_state_d.peer_heap_base_remote[dst_pe],
+               (unsigned)st->constmem.lkeys[lidx].key);
+    }
+    __syncthreads();
+    if (nbytes > 0 and threadIdx.x < 32)
+        nvshmemi_ibgda_put_nbi_warp(dst, src, nbytes, dst_pe, qp_id, lane_id, 0);
+}
+
+// 只打印状态、不发数据（发之前先确认状态是不是有效的）
+bool ibgda_probe(int64_t nelem, bool do_put) {
+    const int me = nvshmem_my_pe(), npes = nvshmem_n_pes();
+    const int peer = (me + 1) % npes;
+    const size_t nbytes = nelem * sizeof(int);
+    int* sym = static_cast<int*>(nvshmem_align(256, nbytes));
+    int* local = static_cast<int*>(nvshmem_align(256, nbytes));
+    NANO_HOST_ASSERT(sym and local);
+    std::vector<int> host(nelem, 100 + me);
+    CUDA_CHECK(cudaMemcpy(local, host.data(), nbytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(sym, 0xFF, nbytes));
+    barrier();
+
+    ibgda_probe_kernel<<<1, 32>>>(reinterpret_cast<uint64_t>(sym),
+                                  reinterpret_cast<uint64_t>(local),
+                                  do_put ? nbytes : 0, peer, 0);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    barrier();
+
+    bool ok = true;
+    if (do_put) {
+        std::vector<int> got(nelem);
+        CUDA_CHECK(cudaMemcpy(got.data(), sym, nbytes, cudaMemcpyDeviceToHost));
+        const int want = 100 + peer;
+        for (int64_t i = 0; i < nelem; ++i)
+            if (got[i] != want) { ok = false; break; }
+    }
     nvshmem_free(local);
     nvshmem_free(sym);
     return ok;

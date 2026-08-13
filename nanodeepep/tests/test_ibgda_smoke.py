@@ -63,6 +63,12 @@ def main():
     print(f"[rank{rank}] nvshmem init OK: my_pe={pe}/{_C.n_pes()}", flush=True)
     _C.barrier()
 
+    # 先看设备侧的 IBGDA 状态：手写 WQE 那条路全靠它，状态没填的话 rcs 是空指针
+    _C.ibgda_probe(64, False)
+    _C.barrier()
+    if rank == 0:
+        print("    ↑ 以上是 DeepEP 手写 WQE 路径看到的设备状态")
+
     ok_all = True
     for nelem in (1, 1024, 256 * 1024):
         ok = _C.put_test(nelem)
@@ -70,6 +76,13 @@ def main():
         if rank == 0:
             print(f"    device 侧 put {nelem * 4 / 1024:>9.1f} KB : {'OK' if ok else 'FAIL'}")
     _C.barrier()
+
+    # DeepEP 手写 WQE 路径的实发测试（官方 API 过了不代表这条过）
+    ok_ibgda = _C.ibgda_probe(1024, True)
+    _C.barrier()
+    if rank == 0:
+        print(f"    手写 WQE put (nvshmemi_ibgda_put_nbi_warp) 4KB : {'OK' if ok_ibgda else 'FAIL'}")
+    ok_all &= ok_ibgda
 
     if rank == 0:
         print("=== 全部通过 ===" if ok_all else "=== 有失败 ===")

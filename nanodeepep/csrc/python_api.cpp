@@ -23,6 +23,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("put_test", &nanoep::put_test,
           "device 侧发起的 RDMA put 冒烟测试（走的就是 IBGDA 路径）");
 
+    m.def("ibgda_probe", &nanoep::ibgda_probe,
+          "打印设备侧 IBGDA 状态，并走一次 DeepEP 手写 WQE 的 put");
+
     m.def("buffer_create", &nanoep::buffer_create,
           "分配 LL 的 RDMA 对称缓冲（双缓冲布局同 config.hpp:102-188）");
     m.def("buffer_destroy", &nanoep::buffer_destroy);

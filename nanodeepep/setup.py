@@ -55,6 +55,10 @@ if __name__ == "__main__":
     cxx_flags = ["-O3", "-Wno-deprecated-declarations", "-Wno-unused-variable",
                  "-Wno-sign-compare", "-DDISABLE_AGGRESSIVE_PTX_INSTRS"]
     nvcc_flags = ["-O3", "-Xcompiler", "-O3", "--extended-lambda",
+                  # -lineinfo：让 compute-sanitizer 的报错直接带源码行号。
+                  # 对 -O3 的代码几乎没有性能影响，调 CUDA 内存错误时是刚需。
+                  "-lineinfo",
+                  *([os.environ["NANOEP_EXTRA"]] if os.getenv("NANOEP_EXTRA") else []),
                   "--diag-suppress=128,2417", "-rdc=true",
                   "-DDISABLE_AGGRESSIVE_PTX_INSTRS",
                   # torch 的 cpp_extension 默认加 -D__CUDA_NO_HALF_OPERATORS__ 等一串，

@@ -37,6 +37,7 @@ void finalize();
 int my_pe();
 int n_pes();
 bool put_test(int64_t nelem);
+bool ibgda_probe(int64_t nelem, bool do_put);
 
 // Buffer（nano_buffer.cu）
 void buffer_create(int rank, int num_ranks, int num_experts, int hidden, int m);
