@@ -152,7 +152,12 @@ __global__ void ibgda_probe_kernel(uint64_t dst, uint64_t src, size_t nbytes, in
     }
     __syncthreads();
     if (nbytes > 0 and threadIdx.x < 32)
-        nvshmemi_ibgda_put_nbi_warp(dst, src, nbytes, dst_pe, qp_id, lane_id, 0);
+        // 模板参数必须给 true！ibgda_submit_requests 默认是**批量**提交：
+        // 只有 (message_idx+1) % 4 == 0 时才按门铃（ibgda_post_send）。单发一条消息时
+        // message_idx=0 → 永远不按门铃 → 网卡不发 → 对端收不到 → 挂死。
+        // dispatch 内核里靠 slot_idx 递增自然凑够 4 条，最后由 amo_nonfetch_add
+        // （它用的是 ibgda_submit_requests<true>）兜底刷出去。
+        nvshmemi_ibgda_put_nbi_warp<true>(dst, src, nbytes, dst_pe, qp_id, lane_id, 0);
 }
 
 // 只打印状态、不发数据（发之前先确认状态是不是有效的）

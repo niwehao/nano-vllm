@@ -72,17 +72,31 @@ def main():
             print(f"    不等长 T（rank0=0, rank1=64）通过，rank0 输出 {tuple(out.shape)}")
 
     # ---- 判据 4：确定性 ----
+    # 判据 4：确定性。
+    # ⚠ 两个后端的确定性**语义不同**，这不是 bug：
+    #   nccl 后端：packed_recv_x 里各 rank 的段按 **rank 升序**首尾相接（我们自己定的），
+    #              所以连 packed 的哈希都稳定；
+    #   nvshmem 后端：DeepEP 内核用 atomicAdd(packed_recv_count+l, n) 取 begin，
+    #              段的先后是**到达序**，跑两遍可能不同 —— 但 layout_range 会如实记录，
+    #              所以 **combined_x 仍然位级稳定**。实测正是如此：packed_hash 会飘，
+    #              combined_hash 一模一样。
+    # 因此这里只对 combined_hash 做硬判据，packed_hash 仅在 nccl 后端下检查。
+    check_packed = args.transport == "nccl"
     if rank == 0:
-        print(f"[4] 确定性：同 seed 连跑 {args.det_rounds} 遍，哈希不变")
+        print(f"[4] 确定性：同 seed 连跑 {args.det_rounds} 遍"
+              f"（combined_x 必须位级稳定；packed_recv_x 的段序"
+              f"{'也稳定' if check_packed else '由 atomicAdd 竞争决定，不检查'}）")
     x, idx, w = make_case(args.tokens[-1], args.hidden, E, args.num_topk, rank, seed=7)
     ref = None
     for i in range(args.det_rounds):
         ph, ch = check_all(buf, x, idx, w, group, rank, world, verbose=False)
+        key = (ph, ch) if check_packed else (ch,)
         if ref is None:
-            ref = (ph, ch)
-        assert (ph, ch) == ref, f"第 {i} 轮哈希漂移: {(ph, ch)} != {ref}"
+            ref = key
+        assert key == ref, f"第 {i} 轮哈希漂移: {key} != {ref}"
     if rank == 0:
-        print(f"    packed_hash={ref[0]:x} combined_hash={ref[1]:x}  {args.det_rounds} 轮一致")
+        tag = f"packed_hash={ref[0]:x} combined_hash={ref[1]:x}" if check_packed else f"combined_hash={ref[0]:x}"
+        print(f"    {tag}  {args.det_rounds} 轮一致")
 
     # ---- 判据 6：带宽记录（非门槛，供 M6 对比）----
     if rank == 0:

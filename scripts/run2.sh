@@ -18,7 +18,7 @@ trap cleanup EXIT INT TERM
 
 cleanup; sleep 0.5
 $SSH "cd $REPO && source scripts/env.sh && \
-  setsid nohup env RANK=1 WORLD_SIZE=2 \
+  setsid nohup env PYTHONUNBUFFERED=1 RANK=1 WORLD_SIZE=2 \
     MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT PYTHONPATH=$REPO \
     ${RUN2_LAUNCHER:-} .venv/bin/python $* > /tmp/nano_rank1.log 2>&1 < /dev/null &" >/dev/null 2>&1 &
 # 末尾这个 & 把**本地的 ssh 进程**也放后台，不能省：远端命令里的 & 只让远端
