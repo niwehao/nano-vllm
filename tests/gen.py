@@ -16,6 +16,12 @@ from nanovllm import LLM, SamplingParams
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
+    ap.add_argument("--model", default=None, help="默认用 common.MODEL_PATH（dense Qwen3-0.6B）")
+    ap.add_argument("--ep-size", type=int, default=1)
+    ap.add_argument("--master-addr", default="localhost")
+    ap.add_argument("--master-port", type=int, default=0,
+                    help="0 = 自动挑一个空闲端口。固定 2333 时，上一次跑挂留下的孤儿进程\n会占着端口让下一次 EADDRINUSE —— 单机测试没必要固定端口")
+    ap.add_argument("--ep-transport", default="nccl")
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-k", type=int, default=-1)
@@ -37,6 +43,8 @@ def main():
     ap.add_argument("--pollution", action="store_true",
                     help="两阶段:先跑一遍(可能带投机),再用 prompt+前 32 个生成 token 当新 prompt "
                          "跑第二遍。第二遍必然命中第一遍写入的 block,用来查 prefix cache 污染")
+    ap.add_argument("--router-probe", action="store_true",
+                    help="monkeypatch MoE 块记录每层 topk_idx，落进 JSON 与 HF 逐元素比对")
     ap.add_argument("--prompt-file", type=str, default=None,
                     help="从 JSON 文件读取 prompt(配合 --pollution 产出的 phase2_prompts)")
     args = ap.parse_args()
@@ -44,11 +52,19 @@ def main():
     import torch
     torch.manual_seed(args.seed)
 
+    if args.master_port == 0:
+        import socket
+        with socket.socket() as sk:
+            sk.bind(("", 0))
+            args.master_port = sk.getsockname()[1]
+
     prompts = build_prompts()
     if args.prompts == "single":
         prompts = prompts[:1]
     elif args.prompts == "pair":
         prompts = prompts[2:4]      # long_a / long_b,共享 512 token 前缀
+    elif args.prompts == "long":
+        prompts = prompts[2:3]      # 单条 600 token，一步 prefill 完，便于逐层对齐路由
     elif args.prompts == "preempt":
         prompts = build_preempt_prompts()
     prompts = prompts * args.repeat
@@ -58,6 +74,10 @@ def main():
     kwargs = dict(
         enforce_eager=args.eager,
         tensor_parallel_size=1,
+        ep_size=args.ep_size,
+        master_addr=args.master_addr,
+        master_port=args.master_port,
+        ep_transport=args.ep_transport,
         gpu_memory_utilization=args.gpu_util,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
@@ -70,7 +90,26 @@ def main():
         if args.speculative_model:
             kwargs["speculative_model"] = os.path.expanduser(args.speculative_model)
 
-    llm = LLM(MODEL_PATH, **kwargs)
+    model_path = os.path.expanduser(args.model) if args.model else MODEL_PATH
+    routes = []
+    if args.router_probe:
+        from nanovllm.models import qwen3_moe
+        _orig = qwen3_moe.Qwen3MoeSparseMoeBlock.forward
+
+        def probed(self, x):
+            logits = self.gate(x)
+            probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            tw, ti = torch.topk(probs, self.top_k, dim=-1)
+            # 连 top-(k+1) 的概率一起记：判断路由分歧是不是"第 k 名与第 k+1 名并列"
+            # 造成的，需要这个间隙值
+            v3, i3 = torch.topk(probs, min(self.top_k + 1, probs.size(-1)), dim=-1)
+            routes.append({"idx": ti.tolist(), "topv": v3.tolist()})
+            return _orig(self, x)
+        qwen3_moe.Qwen3MoeSparseMoeBlock.forward = probed
+
+    llm = LLM(model_path, **kwargs)
+    if args.router_probe:
+        routes.clear()          # 丢掉 warmup 那一轮的记录
     sp = SamplingParams(
         temperature=args.temperature,
         top_k=args.top_k,
@@ -103,6 +142,7 @@ def main():
         "config": vars(args),
         "stats": stats,
         "phase2_prompts": phase2_prompts,
+        "routes": routes,
         "outputs": [
             {"token_ids": o["token_ids"], "logprobs": o.get("logprobs")}
             for o in outputs

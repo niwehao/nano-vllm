@@ -1,34 +1,68 @@
-import pickle
+import os
+
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler, compute_probs, sample_from_probs
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils import parallel
+
+
+_MODEL_REGISTRY = {
+    "Qwen3ForCausalLM": Qwen3ForCausalLM,
+    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
+}
 
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event] | None = None):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        # [NEW] world 现在是 TP 与 EP 的较大者。单机 TP 时 = tensor_parallel_size(原语义),
+        #       跨机 EP 时 = ep_size = 节点数。
+        self.world_size = max(config.tensor_parallel_size, config.ep_size)
         self.rank = rank
-        self.event = event
+        # 调试开关：每步把 logits 校验和跨 rank 比一遍，证明"复制计算"两边真的算了
+        # 同样的东西。默认关（每步一次 gloo all_gather，不该进热路径）。
+        self._ep_check = os.environ.get("NANOVLLM_EP_CHECK") == "1"
+        self.event = event                     # [OLD] 单机 TP 的 mp.Event,已退役,只为签名兼容留着
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        # [OLD ↓] 原来这里是写死的 dist.init_process_group("nccl", "tcp://localhost:2333", ...)
+        #         + torch.cuda.set_device(rank) —— localhost 让它只能单机,set_device(rank)
+        #         在"每机一卡"的多机形态下会去选不存在的 cuda:1。
+        # [NEW] 地址来自 config(单机默认仍是 localhost:2333,行为不变);EP 模式每台机器
+        #       只有一张卡,恒选 device 0。
+        parallel.init_distributed(config, rank)
+        torch.cuda.set_device(0 if config.ep_size > 1 else rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)#权重是未初始化的空张量,但形状已是切分后的
+        # dense 模型没有 MoE 层，也就没有 dispatch/combine —— EP=2 跑 dense 时
+        # 两 rank 只是复制计算（M1 的等价性验收正是靠这一点），不建 buffer。
+        if config.ep_size > 1 and getattr(hf_config, "num_experts", 0) > 0:
+            # 进程级单例，MoE 层每层共用同一个 buffer —— LL 语义下 dispatch/combine
+            # 成对调用就能复用（DeepEP 的 decode 示例同款用法）。
+            # M 取 max_num_batched_tokens：scheduler 的预算保证每步 token 数不超过它，
+            # 所以一条 LL 路径同时覆盖 prefill 和 decode。
+            # 放在建模型之前：它占的显存要计进 allocate_kv_cache 的 used，别让 KV 超发。
+            import nanodeepep
+            nanodeepep.init_ep_buffer(
+                group=parallel.get_ep_group(),
+                num_max_dispatch_tokens_per_rank=config.max_num_batched_tokens,
+                hidden=hf_config.hidden_size,
+                num_experts=hf_config.num_experts,
+                transport=config.ep_transport)
+        # [NEW] 按 hf_config.architectures[0] 分发，不再写死 Qwen3ForCausalLM
+        self.model = _MODEL_REGISTRY[hf_config.architectures[0]](hf_config)#权重是未初始化的空张量,但形状已是切分后的
         load_model(self.model, config.model)## 从 safetensors 填入
         self.sampler = Sampler()
         self.warmup_model()
@@ -38,21 +72,23 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # [OLD ↑ 下一行行尾] 原注释保留原文不动;它说的"TP"现在不止 TP
+        # [NEW] 现状:同一段代码同时服务单机 TP 和跨机 EP,通道从 SharedMemory 换成了
+        #       gloo broadcast(见 send_cmd/recv_cmd)。"让 worker 进入待命状态"没变。
         if self.world_size > 1:#给 TP 建立控制通道,并让 worker 进入待命状态。
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)#创建一块 1MB 的共享内存,取名 "nanovllm"。然后 barrier 等所有 rank 到齐。
-                dist.barrier()
-            else:
-                dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")#按名字 attach 到同一块内存
+            # [OLD ↓] 下面两行原本描述的是 SharedMemory 控制面,那条路已整体换成 gloo
+            #         broadcast(见 send_cmd/recv_cmd),这两行注释保留原文备查。
+            #     self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)#创建一块 1MB 的共享内存,取名 "nanovllm"。然后 barrier 等所有 rank 到齐。
+            #     self.shm = SharedMemory(name="nanovllm")#按名字 attach 到同一块内存
+            # [NEW] 控制通道 = gloo 组的 broadcast_object_list,同机/跨机同一条代码路径;
+            #       barrier 的作用不变(等所有 rank 到齐再放 worker 进 loop)。
+            dist.barrier()
+            if rank != 0:
                 self.loop()
 
     def exit(self):
         if self.world_size > 1:
-            self.shm.close()
             dist.barrier()
-            if self.rank == 0:
-                self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
@@ -60,33 +96,61 @@ class ModelRunner:
 
     def loop(self):
         while True:
-            method_name, args = self.read_shm()#阻塞等 rank 0 的指令,收到就执行,执行完继续等。
+            method_name, args = self.recv_cmd()#阻塞等 rank 0 的指令,收到就执行,执行完继续等。
             self.call(method_name, *args)#一次迭代 = 一次完整前向+生成 batch 个token
             if method_name == "exit":
                 break
 
-    def read_shm(self):
+    # [OLD ↓] read_shm/write_shm 这对函数已删除,它们靠同机 SharedMemory + mp.Event
+    #         传指令,跨机不可用。下面的 recv_cmd/send_cmd 是等价替换:
+    #         gloo 组的 broadcast_object_list,底层同样是 pickle,同机跨机一条路径。
+    #         代价实测 0.26-0.28 ms/次(scripts/m0_nccl_test.py 的 L3-3),nano 可接受。
+    def recv_cmd(self):
         assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
-        return method_name, args
+        buf = [None]
+        dist.broadcast_object_list(buf, src=0, group=parallel.get_cpu_group())
+        return buf[0][0], buf[0][1]
 
-    def write_shm(self, method_name, *args):
+    def send_cmd(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
-        n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
-        for event in self.event:
-            event.set()
+        dist.broadcast_object_list([(method_name, args)], src=0, group=parallel.get_cpu_group())
 
+    # [OLD ↓ 下面 2 行行尾] 两条原注释保留原文不动,均已与现状不符:
+    #   "8 张卡各算各的那份权重分片,靠 NCCL all-reduce 汇总" —— 那是单机 TP 的图景;
+    #   "共享内存" —— 传指令的通道已经换掉了。
+    # [NEW] 现状:
+    #   EP 模式是 2 台机器各跑**同一批**(TP=1,权重不切,前向里没有 all-reduce),
+    #   只在 MoE 层内部做 EP(dispatch/combine);单机 TP 的原语义仍然成立。
+    #   指令通道 = gloo 组的 broadcast_object_list,不再是 SharedMemory。
     def call(self, method_name, *args):#效果是 8 张卡同时进入 run,各算各的那份权重分片,靠 NCCL all-reduce 汇总
         if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)#共享内存
+            self.send_cmd(method_name, *args)#共享内存
         method = getattr(self, method_name, None)
         return method(*args)# model_runner.py:196
+
+    def check_logits_across_ranks(self, input_ids, positions, logits):
+        """NANOVLLM_EP_CHECK=1 时用：两机同型号同库版本，复制计算的 logits 应当位级一致。
+        输入(input_ids/positions)一起比，好把"输入就不同"和"输入相同但算出来不同"分开——
+        前者是广播/pickle 的搬运 bug，后者才是数值问题。"""
+        ctx = get_context()
+        h = {
+            "in": [list(input_ids.shape), int(input_ids.sum()), int(positions.sum())],
+            "slot": int(ctx.slot_mapping.sum()) if ctx.slot_mapping is not None else -1,
+            "clen": int(ctx.context_lens.sum()) if ctx.context_lens is not None else -1,
+            "lidx": int(ctx.logits_indices.sum()) if ctx.logits_indices is not None else -1,
+            "out": [list(logits.shape), float(logits.float().sum()),
+                    float(logits.float().abs().max())],
+        }
+        buf = [None] * self.world_size
+        dist.all_gather_object(buf, (self.rank, h), group=parallel.get_cpu_group())
+        if self.rank == 0:
+            ref = buf[0][1]
+            for r, v in buf[1:]:
+                bad = [k for k in ref if v[k] != ref[k]]
+                if bad:
+                    print(f"[EP_CHECK] rank{r} 与 rank0 不一致的项 {bad}: "
+                          f"{ {k: (ref[k], v[k]) for k in bad} }", flush=True)
+            self._ep_check_rounds = getattr(self, "_ep_check_rounds", 0) + 1
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -107,12 +171,21 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # [NEW] 按 TP size 除,不是 world —— EP 模式下 world=2 但 TP=1,
+        #       按 world 除会把每机的 KV 头数错切一半。
+        num_kv_heads = hf_config.num_key_value_heads // parallel.get_tp_size()
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         max_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert max_blocks > 0
         if config.num_kvcache_blocks < 0:
+            # [NEW] 多 rank 时块数必须全体一致:block id 由 rank0 的 scheduler 统一分配,
+            #       某个 rank 的 cache 更小就会越界。两机显存同规格但驱动版本不同
+            #       (595 vs 610),mem_get_info 的余量可能差几 MB —— 以 rank0 为准广播。
+            if self.world_size > 1:
+                buf = [max_blocks]
+                dist.broadcast_object_list(buf, src=0, group=parallel.get_cpu_group())
+                max_blocks = buf[0]
             config.num_kvcache_blocks = max_blocks
         else:
             # 显式指定 block 数(测试里用来稳定复现抢占路径),但不能超过显存放得下的上限
@@ -382,6 +455,8 @@ class ModelRunner:
         #这里context是真数据,之前只是一个烧录地址的动作
         sample_args = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, use_graph)
+        if self._ep_check and self.world_size > 1:
+            self.check_logits_across_ranks(input_ids, positions, logits)
         if self.rank != 0:
             reset_context()
             return None

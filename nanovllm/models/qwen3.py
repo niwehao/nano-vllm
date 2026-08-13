@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 import torch.distributed as dist
+
+from nanovllm.utils import parallel
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
@@ -26,7 +28,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = parallel.get_tp_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

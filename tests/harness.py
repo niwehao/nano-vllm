@@ -136,6 +136,18 @@ def check_equal_or_noise(pa, pb, title, name_a="A", name_b="B", max_ulp=4):
 BF16_ULP = 0.0625
 
 
+def ulp_for(absmax: float) -> float:
+    """按 logits 的实际量级算一个 bf16 ulp。
+
+    BF16_ULP=0.0625 是按 dense Qwen3-0.6B 的 logits 量级(8~32)定的常数。tiny-qwen3-moe
+    是随机权重，logits |max| 只有 ~4，ulp = 2^-8 * 4 = 0.0156 —— 差 4 倍。
+    继续套 0.0625 会让判据松 4 倍，等于没判。所以对拍 MoE 时用这个函数现算。
+    """
+    import math
+    e = math.ceil(math.log2(max(absmax, 1e-6)))
+    return 2.0 ** (e - 8)
+
+
 def compare_logprobs(pa, pb, title, max_ulp=4, step=0):
     """比对两次运行在同一位置的 logprob 分布。
 
