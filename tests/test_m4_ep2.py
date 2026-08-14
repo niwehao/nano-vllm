@@ -18,6 +18,8 @@ from harness import (OUT_DIR, PYTHON, ROOT, check_equal_or_noise,   # noqa: E402
 
 MOE = "~/huggingface/tiny-qwen3-moe"
 EP_PORT = int(os.environ.get("EP_PORT", "29500"))
+# M6 切后端时只改这一个环境变量：EP_TRANSPORT=nvshmem .venv/bin/python tests/test_m4_ep2.py
+EP_TRANSPORT = os.environ.get("EP_TRANSPORT", "nccl")
 LAUNCH = os.path.join(ROOT, "scripts", "launch_both.sh")
 GPU01 = "192.168.100.1"
 
@@ -30,7 +32,8 @@ def run_gen_ep(name, mnbt=512, kvblocks=-1, **kwargs):
                 "--model", MOE, "--eager", "--ep-size", "2",
                 "--master-addr", "192.168.100.2", "--master-port", str(EP_PORT),
                 "--max-num-batched-tokens", str(mnbt),
-                "--num-kvcache-blocks", str(kvblocks)]
+                "--num-kvcache-blocks", str(kvblocks),
+                "--ep-transport", EP_TRANSPORT]
     for k, v in kwargs.items():
         flag = "--" + k.replace("_", "-")
         if isinstance(v, bool):
@@ -39,7 +42,8 @@ def run_gen_ep(name, mnbt=512, kvblocks=-1, **kwargs):
         elif v is not None:
             gen_args += [flag, str(v)]
     env = dict(os.environ, MODEL=os.path.expanduser(MOE), MNBT=str(mnbt),
-               KVBLOCKS=str(kvblocks), MASTER_PORT=str(EP_PORT), NOSYNC="1")
+               KVBLOCKS=str(kvblocks), MASTER_PORT=str(EP_PORT), NOSYNC="1",
+               TRANSPORT=EP_TRANSPORT)
     print(f"  $ launch_both.sh gen.py {' '.join(gen_args[3:])}")
     r = subprocess.run(["bash", LAUNCH] + gen_args, cwd=ROOT, env=env,
                        capture_output=True, text=True)
@@ -198,7 +202,7 @@ def test_6_gpudirect(results):
 
 def main():
     print("=" * 70)
-    print(">>> M4 · EP 集成（双机 4 专家，NCCL 后端）")
+    print(f">>> M4 · EP 集成（双机 4 专家，transport={EP_TRANSPORT}）")
     print("=" * 70)
     subprocess.run(["bash", os.path.join(ROOT, "scripts", "sync.sh")],
                    cwd=ROOT, capture_output=True, text=True)
