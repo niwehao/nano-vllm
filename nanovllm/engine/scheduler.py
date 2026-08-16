@@ -72,10 +72,16 @@ class Scheduler:
             # 投机解码:本轮除了 last_token,还要一起验证 k 个草稿 token,
             # 所以要一次预留 k+1 个位置的 KV 空间,而不是 may_append 的一次一块。
             draft = self.propose_draft(seq)
-            if len(scheduled_seqs) and num_batched_tokens + 1 + len(draft) > self.max_num_batched_tokens:
+            # [NEW] 草稿模型路径:草稿要跑一遍 GPU 才有,只能在 ModelRunner.run() 里产出,
+            # 这里拿不到。所以按最坏情况先把 k 个位置的 KV 和 token 预算预留掉,
+            # seq.draft_tokens 留空,由 run() 回填成长度恰为 k 的真实草稿。
+            # vLLM 也是在预算里额外扣草稿位(v1/core/sched/scheduler.py:701
+            # input_budget -= num_new_tokens + draft_slots)。
+            num_spec = self.num_spec_tokens if self.spec_method == "model" else len(draft)
+            if len(scheduled_seqs) and num_batched_tokens + 1 + num_spec > self.max_num_batched_tokens:
                 self.running.appendleft(seq)
                 break
-            while not self.block_manager.ensure_capacity(seq, len(draft)):#现在有没有地方写这条 seq 的下一个 token 的 KV"
+            while not self.block_manager.ensure_capacity(seq, num_spec):#现在有没有地方写这条 seq 的下一个 token 的 KV"
                 if self.running:#如果自己的 running 里还有别的 seq,就抢它们的 block。抢完后回到 while 重新检查,还不够就再抢下一个。
                     self.preempt(self.running.pop())
                     # if self.running: — running 里还有别的 seq,就抢它们。self.running.pop() 取队尾(最晚加入的那条),preempt 把它的全部 block 释放掉、状态改回 WAITING、塞进 waiting 队首(scheduler.py:75-79)。
@@ -85,12 +91,12 @@ class Scheduler:
                     break
             else:
                 seq.draft_tokens = draft
-                seq.num_scheduled_tokens = 1 + len(draft)
+                seq.num_scheduled_tokens = 1 + num_spec
                 seq.is_prefill = False
                 scheduled_seqs.append(seq)
                 num_batched_tokens += seq.num_scheduled_tokens
-                if draft:
-                    self.spec_proposed += len(draft)
+                if num_spec:
+                    self.spec_proposed += num_spec
                     self.spec_steps += 1
         num_decode_seqs = len(scheduled_seqs)
         self.running.extendleft(reversed(scheduled_seqs))#把这一轮 popleft 出来的 seq 按原顺序放回 running 队首。
@@ -142,6 +148,10 @@ class Scheduler:
         self.stats["preempted"] += 1
         # 被抢占的 seq 会走全量重 prefill,本轮的草稿作废
         seq.draft_tokens = []
+        # [NEW] 两套 KV 一起归零:deallocate 会把 num_cached_tokens 清零、block 全还回去,
+        # 重 prefill 时草稿模型跟着目标同步跑同一批 chunk 从头对齐,
+        # 不能带着上一段的进度进新一轮。
+        seq.draft_num_cached_tokens = 0
         seq.num_scheduled_tokens = 0
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
@@ -171,6 +181,14 @@ class Scheduler:
             if seq.draft_tokens:
                 num_accepted = accepted[i]
                 self.spec_accepted += num_accepted
+                # [NEW] 草稿侧的账,必须在 append 之前拿到旧长度 L。
+                # 这一轮草稿写到位置 L+k-2(含),即前 L+k-1 个位置的草稿 KV 有效;
+                # 真实 token 只到 L+a-1,所以取两者较小的。
+                #   a<k  -> L+a   = 新长度-1,与目标齐平
+                #   a==k -> L+k-1 = 新长度-2,欠一格,下一轮第一次前向吃 2 个 token
+                # 只对草稿模型路径有意义,n-gram 路径下这个字段没人读。
+                draft_cached = min(seq.num_tokens + num_accepted,
+                                   seq.num_tokens + len(seq.draft_tokens) - 1)
                 # 先把被接受的草稿落进 token_ids:hash_blocks 要按 block 的实际内容算 hash,
                 # 而这些位置的 KV 这一轮确实已经算出来了。
                 for t in new_tokens[:num_accepted]:
@@ -180,6 +198,7 @@ class Scheduler:
                 # hash_blocks 就会把一个含"被拒绝位置的垃圾 KV"的 block 登记进 prefix cache
                 # 索引,之后命中该前缀的请求会直接读到错误的 KV —— 这就是 prefix cache 污染。
                 seq.num_scheduled_tokens = 1 + num_accepted
+                seq.draft_num_cached_tokens = draft_cached
                 seq.draft_tokens = []
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens

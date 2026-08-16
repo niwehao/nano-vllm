@@ -41,6 +41,17 @@ class Sequence:#引擎处理这条请求过程中需要记住的所有信息,都
         self.token_offset = 0
         # 投机解码:本轮提议的草稿 token(还没被目标模型验证,不算进 token_ids)
         self.draft_tokens: list[int] = []
+        # Phase 3B:草稿模型已经算好 KV 的 token 数,语义与 num_cached_tokens 平行
+        # (位置 0..draft_num_cached_tokens-1 的**草稿** KV 有效)。
+        # 稳态下它等于 num_cached_tokens,只有"上一轮草稿全被接受"时会少 1:
+        # 草稿一轮跑 k 次前向,写位置 .. len+k-2,却提议到 d_k —— 最后那个 d_k
+        # 自己的 KV 没人算。下一轮草稿的第一次前向吃 2 个 token 而不是 1 个补上。
+        # vLLM 对 draft_model 也是每条请求多留 1 个 slot,同一件事
+        # (vllm/config/speculative.py:1453-1455)。
+        # 存绝对值而不是"落后几格":万一某几轮没给这条 seq 打草稿(比如运行期把
+        # num_spec_tokens 改成 0),差值会越拉越大,绝对值能自己算出要补多长的
+        # chunk,补不进图就退回 eager,不会静默错位。
+        self.draft_num_cached_tokens = 0
         self.block_table = []#这条 seq 占用的 KV cache block 编号,入队时是空的,等 scheduler 真正调度到它才分配
         self.temperature = sampling_params.temperature
         self.top_p = sampling_params.top_p

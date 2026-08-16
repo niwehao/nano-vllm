@@ -3,6 +3,29 @@
 `Config` 的全部字段都在 `nanovllm/config.py`,通过 `LLM(model, **kwargs)` 传入
 (`llm_engine.py:17-20` 只挑 `Config` 里存在的字段,其余 kwargs 被忽略)。
 
+## Phase 3B 草稿模型 新增
+
+| 名字 | 位置 | 默认 | 作用 |
+|---|---|---|---|
+| `draft_sample_method` | `nanovllm/config.py:36` | `"greedy"` | 草稿模型怎么采下一个草稿 token,决定接受规则走哪一支。`"greedy"` = 取 argmax,草稿分布 q 是 one-hot δ_d,通用式 `min(1,p/q)` 精确退化成 `p(d)`,不需要保存 `[B,k,V]` 的 q(vLLM 的默认也是这个,`config/speculative.py:290`)。`"random"` = 按 q 采样,走通用接受式,显存多花 `k·B·V·4B`。两者产出的 token 分布**都**严格等于目标分布 p,只影响接受率。 |
+| `draft_cudagraph` | `nanovllm/config.py:37` | `True` | 是否给草稿模型录两族 CUDA graph(q=1 的 decode 族 + `q_max=2` 的 varlen 族)。`False` 时草稿的 k 次前向全走 eager。**只该用于 A/B 对照** —— 第一阶段 E3 实测 bs=8/ctx=512 时草稿不图化的成本比是 1.326,直接亏。只在 `speculative_method="model"` 且 `enforce_eager=False` 时起作用。 |
+
+对应的测试开关:`tests/gen.py --draft-sample-method`、`--no-draft-cudagraph`(`tests/gen.py:42-45`)。
+
+已有但本阶段才真正生效的两项:`speculative_method="model"`、`speculative_model=<路径>`。
+开启时会额外断言:两个模型的 `vocab_size` 相等且 `tokenizer.json`/`vocab.json`/`merges.txt`
+逐字节相同(`model_runner.py:build_draft_model`);且 `tensor_parallel_size == ep_size == 1`
+(`config.py:__post_init__`,原因见 08 报告"遗留")。
+
+运行期的观测量:
+
+| 名字 | 位置 | 作用 |
+|---|---|---|
+| `Sequence.draft_num_cached_tokens` | `nanovllm/engine/sequence.py:54` | 草稿模型已经算好 KV 的 token 数,语义与 `num_cached_tokens` 平行。稳态下两者相等,只有「上一轮草稿全被接受」时会少 1(第 k 个草稿 token 自己的 KV 这一轮没人算),下一轮草稿的第一次前向吃 2 个 token 补上。差值大于 2 时草稿第一步自动退回 eager,不会静默错位。 |
+| `ModelRunner.exec_stats` 的 `draft_*` 三项 | `nanovllm/engine/model_runner.py:44-46` | `draft_graph_varlen` / `draft_graph_decode` / `draft_eager`,草稿那 k 次前向分别走了哪条路。`draft_eager` 里含每次 prefill 同步(那一次必然 eager)。 |
+
+---
+
 ## Phase 2.5 Step B 新增
 
 | 名字 | 位置 | 默认 | 作用 |
@@ -44,8 +67,8 @@
 | 名字 | 默认 | 作用 |
 |---|---|---|
 | `num_speculative_tokens` | 0 | 每步提议几个草稿 token。0 = 关闭投机。 |
-| `speculative_method` | `"ngram"` | `"ngram"` = prompt-lookup,不需要第二个模型;`"model"` = 草稿模型(配置项就位但未实现,见 05 报告遗留项 2)。 |
-| `speculative_model` | `None` | `method="model"` 时的草稿模型路径。 |
+| `speculative_method` | `"ngram"` | `"ngram"` = prompt-lookup,不需要第二个模型;`"model"` = 草稿模型(Phase 3B 已实现,见上)。 |
+| `speculative_model` | `None` | `method="model"` 时的草稿模型路径。必须与目标模型同分词器同词表。 |
 | `ngram_prompt_lookup_max` | 4 | n-gram 匹配时尝试的最长模式。 |
 | `ngram_lookup_window` | 2048 | 只在最近这么多 token 里回溯,控制 CPU 开销。 |
 

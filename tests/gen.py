@@ -39,6 +39,10 @@ def main():
     ap.add_argument("--speculative-method", type=str, default="model")
     ap.add_argument("--no-varlen-cudagraph", action="store_true",
                     help="关掉 Phase 2.5 Step B 的 varlen 图族,退回 Step A(投机批走 eager)")
+    ap.add_argument("--draft-sample-method", type=str, default="greedy",
+                    help="greedy | random —— 草稿怎么采样,决定 q 是 δ 还是真实分布")
+    ap.add_argument("--no-draft-cudagraph", action="store_true",
+                    help="关掉 Phase 3B 草稿模型的两族图(用来实测不图化的代价)")
     ap.add_argument("--prompts", type=str, default="default",
                     help="default | single | pair | preempt")
     ap.add_argument("--repeat", type=int, default=1, help="把 prompt 集重复几遍(制造并发)")
@@ -86,6 +90,8 @@ def main():
         max_model_len=args.max_model_len,
         num_kvcache_blocks=args.num_kvcache_blocks,
         varlen_cudagraph=not args.no_varlen_cudagraph,
+        draft_cudagraph=not args.no_draft_cudagraph,
+        draft_sample_method=args.draft_sample_method,
     )
     if args.num_speculative_tokens > 0:
         kwargs["num_speculative_tokens"] = args.num_speculative_tokens
