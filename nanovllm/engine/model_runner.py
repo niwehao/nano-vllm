@@ -35,6 +35,14 @@ class ModelRunner:
         # 同样的东西。默认关（每步一次 gloo all_gather，不该进热路径）。
         self._ep_check = os.environ.get("NANOVLLM_EP_CHECK") == "1"
         self.event = event                     # [OLD] 单机 TP 的 mp.Event,已退役,只为签名兼容留着
+        # 每个 step 走了哪条执行路径。硬性要求:必须能算出"走图的 step 占比",
+        # 否则没法证明新录的 varlen 图真的在被 replay 而不是摆设。
+        #   graph_decode = 纯 decode 批 replay 老的 flash_attn_with_kvcache 图
+        #   graph_varlen = 投机批 replay 新的 varlen 图(Step B)
+        #   eager        = 其余(混批、超桶、enforce_eager)
+        self.exec_stats = {"graph_decode": 0, "graph_varlen": 0, "eager": 0}
+        # warmup_model 会先跑一次 run(),那时 varlen 图还没录 —— 这个标志必须先存在
+        self.varlen_graph_ready = False
 
         # [OLD ↓] 原来这里是写死的 dist.init_process_group("nccl", "tcp://localhost:2333", ...)
         #         + torch.cuda.set_device(rank) —— localhost 让它只能单机,set_device(rank)
@@ -69,6 +77,13 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+            # 投机关掉时 q 恒为 1,投机批根本不会出现,这族图一张都不用录。
+            if config.varlen_cudagraph and config.num_speculative_tokens > 0:
+                self.capture_varlen_cudagraph()
+        # warmup_model() 自己会跑一次 run(),那一次会被记成 eager。它不是真实请求,
+        # 计进去会把"走图占比"算低。这里清零,让计数只覆盖真正的 step。
+        for key in self.exec_stats:
+            self.exec_stats[key] = 0
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -90,6 +105,8 @@ class ModelRunner:
         if self.world_size > 1:
             dist.barrier()
         if not self.enforce_eager:
+            if self.varlen_graph_ready:
+                del self.varlen_graphs
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
@@ -429,6 +446,85 @@ class ModelRunner:
             return False
         return len(seqs) <= self.graph_bs[-1]
 
+    def is_spec_decode(self, seqs: list[Sequence]) -> bool:
+        # "投机批":没有 prefill,但至少一条 seq 带草稿(q 长度 1+draft > 1)。
+        # 批内 q 长度可以参差不齐 —— 这正是 varlen 图能吃下、而老 decode 图吃不下的形态。
+        # 上界 1+k 是图的容量:缓冲区按最坏情况 bs*(1+k) 行开的,超了放不下。
+        q_max = 1 + self.config.num_speculative_tokens
+        if any(seq.is_prefill for seq in seqs):
+            return False
+        if not any(seq.num_scheduled_tokens > 1 for seq in seqs):
+            return False
+        return all(1 <= seq.num_scheduled_tokens <= q_max for seq in seqs)
+
+    def use_varlen_cudagraph(self, seqs: list[Sequence]) -> bool:
+        # 与 use_cudagraph 严格并列的第二个"要不要 replay"判断,同样和"用哪个 kernel"分开
+        # (坑 5 的教训:两件事合成一个条件会悄悄丢性能)。
+        if self.enforce_eager or not self.varlen_graph_ready:
+            return False
+        if not self.is_spec_decode(seqs):
+            return False
+        return len(seqs) <= self.graph_bs[-1]
+
+    @torch.inference_mode()
+    def run_varlen_graph(self, input_ids: torch.Tensor, positions: torch.Tensor, num_seqs: int):
+        """投机批走 varlen 图。context 必须是 prepare_batch 刚产出的那份(变长形态)。
+
+        方案 C 的要点:草稿长度保持 ngram 给出的原样,不伪造任何 draft token。
+        批内 q 长度参差不齐由 cu_seqlens_q(设备张量,replay 前刷新)表达,
+        图里烧死的只有 max_seqlen_q=1+k 和 max_seqlen_k=max_model_len 两个 host 标量。
+        缓冲区按最坏情况 bs*(1+k) 行开,多出来的行挂给一条 sink seq:
+        它的 k 长度为 0(FA 对 seqlen_k=0 的行输出恰为全 0,第一阶段 Q3 实测),
+        slot_mapping 为 -1(store_kvcache_kernel 跳过,attention.py:23),输出丢弃。
+        """
+        context = get_context()
+        gv = self.graph_varlen_vars
+        q_max = 1 + self.config.num_speculative_tokens
+        bs = next(x for x in self.graph_bs if x >= num_seqs)
+        num_tokens = input_ids.size(0)          # 本轮真实 token 数
+        total = bs * q_max                      # 该桶的缓冲区行数
+        nslot = 2 * bs                          # bs 个真实槽 + 至多 bs 个 padding 槽
+        # max_seqlen_k 是烧进图的 host 标量(= max_model_len)。真实 k 长度超过它时
+        # FA 会按 n_blocks_per_split 截断,悄悄少读一段 KV —— 宁可在这里响。
+        assert context.max_seqlen_k <= self.config.max_model_len, \
+            f"max_seqlen_k={context.max_seqlen_k} 超过图里烧死的 {self.config.max_model_len}"
+
+        gv["input_ids"][:num_tokens] = input_ids
+        gv["input_ids"][num_tokens:total] = 0
+        gv["positions"][:num_tokens] = positions
+        gv["positions"][num_tokens:total] = 0
+        gv["slot_mapping"][:total].fill_(-1)
+        gv["slot_mapping"][:num_tokens] = context.slot_mapping
+        gv["cu_seqlens_q"][:num_seqs + 1] = context.cu_seqlens_q
+        gv["cu_seqlens_k"][:num_seqs + 1] = context.cu_seqlens_k
+        # 剩下的 total-num_tokens 行分给若干 padding 槽,每槽至多 q_max 行,
+        # 且 k 长度 = q 长度(指向 block 0)。**两个约束都不能松**:
+        #   q 长度 ≤ q_max ≤ 64:图的 m 维 grid 烧死为 ceil(max_seqlen_q/64)=1,
+        #                        一格里超过 64 行的部分永远不会被写,会留下未初始化显存;
+        #   k 长度 ≥ 1        :k 长度为 0 会让 FA 走 flash_fwd_kernel.h:537 的 early-exit
+        #                        分支,而那个分支算 LSE 偏移用的是 **padded** 公式(:545),
+        #                        没有理会 params.unpadded_lse —— 但 varlen 的 softmax_lse
+        #                        是按 {num_heads, total_q} 的 unpadded 布局分配的
+        #                        (flash_api.cpp:652 + :688)。于是最后一格会写出缓冲区。
+        #                        实测(compute-sanitizer + PYTORCH_NO_CUDA_MEMORY_CACHING=1):
+        #                        k 长度 0 -> "Invalid __global__ write of size 4 bytes";
+        #                        k 长度 = q 长度 -> 0 errors。见 tests/phase25_probes/probe_sink_memcheck.py
+        n = nslot + 1 - num_seqs
+        dst_q = gv["cu_seqlens_q"][num_seqs:nslot + 1]
+        torch.add(gv["pad_ramp"][:n], num_tokens, out=dst_q)
+        dst_q.clamp_(max=total)
+        dst_k = gv["cu_seqlens_k"][num_seqs:nslot + 1]
+        torch.sub(dst_q, num_tokens, out=dst_k)
+        dst_k += context.cu_seqlens_k[num_seqs]
+        # padding 槽读 block 0 的垃圾 KV(输出丢弃)。q_max ≤ block_size,一块就够。
+        gv["block_tables"][num_seqs:nslot, 0] = 0
+        gv["block_tables"][:num_seqs, :context.block_tables.size(1)] = context.block_tables
+
+        self.varlen_graphs[bs].replay()
+        # compute_logits 在图外,用的是 prepare_batch 产出的真实 logits_indices,
+        # 它只指向真实行,padding 槽的行天然被丢弃。
+        return self.model.compute_logits(gv["outputs"][:num_tokens])
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, use_graph: bool):
         if not use_graph:
@@ -451,10 +547,18 @@ class ModelRunner:
     def run(self, seqs: list[Sequence]):
         pure_decode = self.is_pure_decode(seqs)
         use_graph = pure_decode and self.use_cudagraph(seqs)
+        # 第三条路:投机批(无 prefill、批内 q 长度 1..1+k 参差)走新录的 varlen 图。
+        # 与 use_graph 互斥 —— 纯 decode 批仍归老图,那条路的快 kernel 不能丢(坑 5)。
+        use_varlen_graph = not pure_decode and self.use_varlen_cudagraph(seqs)
         input_ids, positions = self.prepare_decode(seqs) if pure_decode else self.prepare_batch(seqs)
         #这里context是真数据,之前只是一个烧录地址的动作
         sample_args = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, use_graph)
+        if use_varlen_graph:
+            self.exec_stats["graph_varlen"] += 1
+            logits = self.run_varlen_graph(input_ids, positions, len(seqs))
+        else:
+            self.exec_stats["graph_decode" if use_graph else "eager"] += 1
+            logits = self.run_model(input_ids, positions, use_graph)
         if self._ep_check and self.world_size > 1:
             self.check_logits_across_ranks(input_ids, positions, logits)
         if self.rank != 0:
@@ -514,3 +618,81 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+    @torch.inference_mode()
+    def capture_varlen_cudagraph(self):
+        """Step B:给投机批再录一族 varlen 形态的图。
+
+        与 capture_cudagraph 的三点不同:
+          1) attention 走 flash_attn_varlen_func —— 即 set_context 的第一个参数为 True
+             那条分支(attention.py:64),不是 flash_attn_with_kvcache;
+          2) 每张图的 q 行数按最坏情况 bs*(1+k) 开,**实际算几行由 cu_seqlens_q 决定**,
+             所以同一张图能吃下批内参差的 q 长度(第一阶段 Q4 实测 5 种组合全部 bitwise 相同);
+          3) seq 槽比桶多一个,最后一个是吸收 padding 行的 sink。
+
+        两个被烧进图的 host 标量:
+          max_seqlen_q = 1+k     每条 seq 的 q 长度上界,批内实际值可以更小;
+          max_seqlen_k = max_model_len   最坏情况(第一阶段 Q2:结果仍正确,
+                         与传真实值的差异 ≤ 0.5 ulp 且与 fp32 参照等距)。
+        """
+        config = self.config
+        hf_config = config.hf_config
+        q_max = 1 + config.num_speculative_tokens
+        # padding 槽每格只放 q_max 行,所以 q_max 不能超过一块能装的 token 数
+        # (每格的 k 长度 = q 长度,block_tables 只填了第 0 列)。
+        assert q_max <= self.block_size, \
+            f"1+num_speculative_tokens={q_max} 超过 kvcache_block_size={self.block_size}"
+        max_bs = self.graph_bs[-1]
+        max_total = max_bs * q_max
+        max_nslot = 2 * max_bs                 # 真实槽 + padding 槽
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        input_ids = torch.zeros(max_total, dtype=torch.int64)
+        positions = torch.zeros(max_total, dtype=torch.int64)
+        slot_mapping = torch.full((max_total,), -1, dtype=torch.int32)
+        cu_seqlens_q = torch.zeros(max_nslot + 1, dtype=torch.int32)
+        cu_seqlens_k = torch.zeros(max_nslot + 1, dtype=torch.int32)
+        block_tables = torch.full((max_nslot, max_num_blocks), -1, dtype=torch.int32)
+        outputs = torch.zeros(max_total, hf_config.hidden_size)
+        # replay 时用来一次算出全部 padding 槽的 cu_seqlens:0, q_max, 2*q_max, ...
+        pad_ramp = torch.arange(0, max_nslot + 1, dtype=torch.int32) * q_max
+        # 捕获时的 warmup 那一次会真的读 KV:让每条 seq 都指向 block 0,读一条合法的垃圾 KV。
+        # (replay 时这一列会被真实 block_table 覆盖;sink 行 k 长度为 0,从不被读 ——
+        #  第一阶段实测 block_tables 的 -1 padding 与填 0 逐位相同,即根本没读。)
+        block_tables[:, 0] = 0
+
+        self.varlen_graphs = {}
+        for bs in reversed(self.graph_bs):
+            total = bs * q_max
+            nslot = 2 * bs                      # bs 个真实槽 + 至多 bs 个 padding 槽
+            # 捕获前填一份合法数据:bs 条 seq 各 q_len=k_len=q_max,padding 槽长度 0。
+            # 缓冲区里的值不影响录下来的 kernel 序列(FA 的 grid 只由 host 标量定),
+            # 但 warmup 那一次得跑得通。
+            cu_seqlens_q[:bs + 1] = pad_ramp[:bs + 1]
+            cu_seqlens_q[bs + 1:nslot + 1] = total
+            cu_seqlens_k[:bs + 1] = pad_ramp[:bs + 1]
+            cu_seqlens_k[bs + 1:nslot + 1] = total
+            graph = torch.cuda.CUDAGraph()
+            set_context(True, cu_seqlens_q[:nslot + 1], cu_seqlens_k[:nslot + 1],
+                        q_max, config.max_model_len, slot_mapping[:total], None,
+                        block_tables[:nslot], None)
+            outputs[:total] = self.model(input_ids[:total], positions[:total])    # warmup
+            with torch.cuda.graph(graph, self.graph_pool):
+                outputs[:total] = self.model(input_ids[:total], positions[:total])    # capture
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            self.varlen_graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.graph_varlen_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            block_tables=block_tables,
+            outputs=outputs,
+            pad_ramp=pad_ramp,
+        )
+        self.varlen_graph_ready = True

@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--speculative-model", type=str, default=None)
     ap.add_argument("--num-speculative-tokens", type=int, default=0)
     ap.add_argument("--speculative-method", type=str, default="model")
+    ap.add_argument("--no-varlen-cudagraph", action="store_true",
+                    help="关掉 Phase 2.5 Step B 的 varlen 图族,退回 Step A(投机批走 eager)")
     ap.add_argument("--prompts", type=str, default="default",
                     help="default | single | pair | preempt")
     ap.add_argument("--repeat", type=int, default=1, help="把 prompt 集重复几遍(制造并发)")
@@ -83,6 +85,7 @@ def main():
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=args.max_model_len,
         num_kvcache_blocks=args.num_kvcache_blocks,
+        varlen_cudagraph=not args.no_varlen_cudagraph,
     )
     if args.num_speculative_tokens > 0:
         kwargs["num_speculative_tokens"] = args.num_speculative_tokens
@@ -132,6 +135,9 @@ def main():
         outputs = llm.generate(phase2_prompts, sp, use_tqdm=False)
 
     stats = dict(getattr(llm.scheduler, "stats", {}))
+    # 走图/走 eager 的 step 计数 —— 用来证明 varlen 图真的在被 replay
+    for k, v in getattr(llm.model_runner, "exec_stats", {}).items():
+        stats[f"exec_{k}"] = v
     accepted = getattr(llm.scheduler, "spec_accepted", None)
     if accepted is not None:
         stats["spec_accepted"] = llm.scheduler.spec_accepted

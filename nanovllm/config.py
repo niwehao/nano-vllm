@@ -22,6 +22,10 @@ class Config:
     speculative_model: str | None = None     # method="model" 时的草稿模型路径
     ngram_prompt_lookup_max: int = 4         # n-gram 匹配时尝试的最长模式
     ngram_lookup_window: int = 2048          # 只在最近这么多 token 里回溯,控制 CPU 开销
+    # Phase 2.5 Step B:给"投机批"(q 长度 = 1+接受前的草稿数,批内参差)再录一族
+    # varlen 形态的 CUDA graph。False 则投机批一律走 eager,即 Step A 的行为。
+    # 只在 num_speculative_tokens > 0 且非 enforce_eager 时才有意义。
+    varlen_cudagraph: bool = True
     # 多机 / 专家并行(EP)。ep_size = 节点数,每机一进程一卡；1 表示单机原行为。
     ep_size: int = 1
     node_rank: int = 0                       # 本进程的全局 rank
